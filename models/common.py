@@ -261,7 +261,7 @@ class Ghost(nn.Module):
 
 class SPPCSPC(nn.Module):
     # CSP https://github.com/WongKinYiu/CrossStagePartialNetworks
-    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5, k=(5, 9, 13), act=True):
+    def __init__(self, c1, c2, act=True, n=1, shortcut=False, g=1, e=0.5, k=(5, 9, 13)):
         super(SPPCSPC, self).__init__()
         c_ = int(2 * c2 * e)  # hidden channels
         self.cv1 = Conv(c1, c_, 1, 1, act=act)
@@ -281,7 +281,7 @@ class SPPCSPC(nn.Module):
 
 class GhostSPPCSPC(SPPCSPC):
     # CSP https://github.com/WongKinYiu/CrossStagePartialNetworks
-    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5, k=(5, 9, 13), act=True):
+    def __init__(self, c1, c2, act=True, n=1, shortcut=False, g=1, e=0.5, k=(5, 9, 13)):
         super().__init__(c1, c2, n, shortcut, g, e, k, act=act)
         c_ = int(2 * c2 * e)  # hidden channels
         self.cv1 = GhostConv(c1, c_, 1, 1, act=act)
