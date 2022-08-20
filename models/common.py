@@ -17,6 +17,7 @@ from utils.general import non_max_suppression, make_divisible, scale_coords, inc
 from utils.plots import color_list, plot_one_box
 from utils.torch_utils import time_synchronized
 
+import onnx_setting
 
 ##### basic ####
 
@@ -797,11 +798,17 @@ class Focus(nn.Module):
     # Focus wh information into c-space
     def __init__(self, c1, c2, k=1, s=1, p=None, g=1, act=True):  # ch_in, ch_out, kernel, stride, padding, groups
         super(Focus, self).__init__()
-        self.conv = Conv(c1 * 4, c2, k, s, p, g, act)
+        if onnx_setting.export_onnx == False:
+            self.conv = Conv(c1 * 4, c2, k, s, p, g, act=act)
+        else:
+            self.conv = Conv(c1, c2, k, s, p, g, act=act) # Mehrdad: Onnx
         # self.contract = Contract(gain=2)
 
     def forward(self, x):  # x(b,c,w,h) -> y(b,4c,w/2,h/2)
-        return self.conv(torch.cat([x[..., ::2, ::2], x[..., 1::2, ::2], x[..., ::2, 1::2], x[..., 1::2, 1::2]], 1))
+        if onnx_setting.export_onnx == False:
+            return self.conv(torch.cat([x[..., ::2, ::2], x[..., 1::2, ::2], x[..., ::2, 1::2], x[..., 1::2, 1::2]], 1))
+        else:
+            return self.conv(x) # Mehrdad: Onnx
         # return self.conv(self.contract(x))
         
 

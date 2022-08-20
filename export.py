@@ -12,9 +12,106 @@ from torch.utils.mobile_optimizer import optimize_for_mobile
 import models
 from models.experimental import attempt_load, End2End
 from utils.activations import Hardswish, SiLU
-from utils.general import set_logging, check_img_size
+from utils.general import set_logging, check_img_size, colorstr, check_version, file_size, check_requirements, check_dataset
 from utils.torch_utils import select_device
 from utils.add_nms import RegisterNMS
+
+
+def export_saved_model(model,
+                       im,
+                       file,
+                       dynamic,
+                       tf_nms=False,
+                       agnostic_nms=False,
+                       topk_per_class=100,
+                       topk_all=100,
+                       iou_thres=0.45,
+                       conf_thres=0.25,
+                       keras=False,
+                       prefix=colorstr('TensorFlow SavedModel:')):
+    # YOLOv5 TensorFlow SavedModel export
+    try:
+        import tensorflow as tf
+        from tensorflow.python.framework.convert_to_constants import convert_variables_to_constants_v2
+
+        import onnx_setting
+        onnx_setting.export_onnx = True
+        #
+        shape = im.shape
+        im = im.view( shape[0], shape[1] * 4, shape[2]//2, shape[3]//2 )
+
+        from models.tf import TFDetect, TFModel
+
+        print(f'\n{prefix} starting export with tensorflow {tf.__version__}...')
+        f = str(file).replace('.pt', '_saved_model')
+        batch_size, ch, *imgsz = list(im.shape)  # BCHW
+
+        tf_model = TFModel(cfg=model.yaml, ch=ch, model=model, nc=model.nc, imgsz=imgsz)
+        im = tf.zeros((batch_size, *imgsz, ch))  # BHWC order for TensorFlow
+        _ = tf_model.predict(im, tf_nms, agnostic_nms, topk_per_class, topk_all, iou_thres, conf_thres)
+        inputs = tf.keras.Input(shape=(*imgsz, ch), batch_size=None if dynamic else batch_size)
+        outputs = tf_model.predict(inputs, tf_nms, agnostic_nms, topk_per_class, topk_all, iou_thres, conf_thres)
+        keras_model = tf.keras.Model(inputs=inputs, outputs=outputs)
+        keras_model.trainable = False
+        keras_model.summary()
+        if keras:
+            keras_model.save(f, save_format='tf')
+        else:
+            spec = tf.TensorSpec(keras_model.inputs[0].shape, keras_model.inputs[0].dtype)
+            m = tf.function(lambda x: keras_model(x))  # full model
+            m = m.get_concrete_function(spec)
+            frozen_func = convert_variables_to_constants_v2(m)
+            tfm = tf.Module()
+            tfm.__call__ = tf.function(lambda x: frozen_func(x)[:4] if tf_nms else frozen_func(x)[0], [spec])
+            tfm.__call__(im)
+            tf.saved_model.save(tfm,
+                                f,
+                                options=tf.saved_model.SaveOptions(experimental_custom_gradients=False)
+                                if check_version(tf.__version__, '2.6') else tf.saved_model.SaveOptions())
+        print(f'{prefix} export success, saved as {f} ({file_size(f):.1f} MB)')
+        return keras_model, f
+    except Exception as e:
+        print(f'\n{prefix} export failure: {e}')
+        return None, None
+
+def export_tflite(keras_model, im, file, int8, data, nms, agnostic_nms, prefix=colorstr('TensorFlow Lite:')):
+    # YOLOv5 TensorFlow Lite export
+    try:
+        from utils.datasets import LoadImages
+        import tensorflow as tf
+
+        print(f'\n{prefix} starting export with tensorflow {tf.__version__}...')
+        batch_size, ch, *imgsz = list(im.shape)  # BCHW
+        # f = str(file).replace('.pt', '-fp16.tflite')
+        f = str(file).replace('.pt', '-fp32.tflite')
+
+        converter = tf.lite.TFLiteConverter.from_keras_model(keras_model)
+        converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS]
+        converter.target_spec.supported_types = [tf.float32]
+        converter.optimizations = [tf.lite.Optimize.DEFAULT]
+        if int8:
+            from models.tf import representative_dataset_gen
+            dataset = LoadImages(check_dataset(data)['train'], img_size=imgsz, auto=False)
+            converter.representative_dataset = lambda: representative_dataset_gen(dataset, ncalib=100)
+            converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+            converter.target_spec.supported_types = []
+            converter.inference_input_type = tf.uint8  # or tf.int8
+            converter.inference_output_type = tf.uint8  # or tf.int8
+            converter.experimental_new_quantizer = True
+            f = str(file).replace('.pt', '-int8.tflite')
+        if nms or agnostic_nms:
+            converter.target_spec.supported_ops.append(tf.lite.OpsSet.SELECT_TF_OPS)
+
+        tflite_model = converter.convert()
+        open(f, "wb").write(tflite_model)
+        print(f'{prefix} export success, saved as {f} ({file_size(f):.1f} MB)')
+        return f
+    except Exception as e:
+        print(f'\n{prefix} export failure: {e}')
+
+
+
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -34,6 +131,8 @@ if __name__ == '__main__':
     parser.add_argument('--include-nms', action='store_true', help='export end2end onnx')
     parser.add_argument('--fp16', action='store_true', help='CoreML FP16 half-precision export')
     parser.add_argument('--int8', action='store_true', help='CoreML INT8 quantization')
+    parser.add_argument('--tflite', action='store_true', help='CoreML INT8 quantization')
+    
     opt = parser.parse_args()
     opt.img_size *= 2 if len(opt.img_size) == 1 else 1  # expand
     opt.dynamic = opt.dynamic and not opt.end2end
@@ -200,6 +299,19 @@ if __name__ == '__main__':
 
     except Exception as e:
         print('ONNX export failure: %s' % e)
+
+
+    # TensorFlow Exports
+    if opt.tflite:
+        if opt.int8:  # TFLite --int8 bug https://github.com/ultralytics/yolov5/issues/5707
+            check_requirements(('flatbuffers==1.12',))  # required before `import tensorflow`
+        model, _ = export_saved_model(model.cpu(),
+                                         img,
+                                         file=opt.weights,
+                                         dynamic=False,
+                                        )
+        if opt.tflite or opt.edgetpu:
+            _ = export_tflite(model, img, file=opt.weights, int8=opt.int8 or opt.edgetpu, data=opt.data)
 
     # Finish
     print('\nExport complete (%.2fs). Visualize with https://github.com/lutzroeder/netron.' % (time.time() - t))
