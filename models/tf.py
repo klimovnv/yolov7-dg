@@ -27,12 +27,12 @@ import torch
 import torch.nn as nn
 from tensorflow import keras
 
-from models.common import (C3, SPP, SPPF, Bottleneck, BottleneckCSP, C3x, Concat, Conv, CrossConv, DWConv,
-                           DWConvTranspose2d, Focus, autopad)
+from models.common import (C3, SPP, SPPF, Bottleneck, BottleneckCSP, C3x, Concat, Conv, CrossConv, DWConv, has_Focus_layer,
+                           DWConvTranspose2d, Focus, autopad, MP, SP)
 from models.experimental import MixConv2d, attempt_load
-from models.yolo import Detect
+from models.yolo import Detect, IDetect
 from utils.activations import SiLU
-from utils.general import LOGGER, make_divisible, print_args
+from utils.general import make_divisible #, print_args
 
 import onnx_setting
 class TFBN(keras.layers.Layer):
@@ -77,8 +77,8 @@ class TFConv(keras.layers.Layer):
             strides=s,
             padding='SAME' if s == 1 else 'VALID',
             use_bias=not hasattr(w, 'bn'),
-            kernel_initializer=keras.initializers.Constant(w.conv.weight.permute(2, 3, 1, 0).numpy()),
-            bias_initializer='zeros' if hasattr(w, 'bn') else keras.initializers.Constant(w.conv.bias.numpy()))
+            kernel_initializer=keras.initializers.Constant(w.conv.weight.permute(2, 3, 1, 0).detach().numpy()),
+            bias_initializer='zeros' if hasattr(w, 'bn') else keras.initializers.Constant(w.conv.bias.detach().numpy()))
         self.conv = conv if s == 1 else keras.Sequential([TFPad(autopad(k, p)), conv])
         self.bn = TFBN(w.bn) if hasattr(w, 'bn') else tf.identity
         self.act = activations(w.act) if act else tf.identity
@@ -188,8 +188,8 @@ class TFConv2d(keras.layers.Layer):
                                         padding='VALID',
                                         use_bias=bias,
                                         kernel_initializer=keras.initializers.Constant(
-                                            w.weight.permute(2, 3, 1, 0).numpy()),
-                                        bias_initializer=keras.initializers.Constant(w.bias.numpy()) if bias else None)
+                                            w.weight.permute(2, 3, 1, 0).detach().numpy()),
+                                        bias_initializer=keras.initializers.Constant(w.bias.detach().numpy()) if bias else None)
 
     def call(self, inputs):
         return self.conv(inputs)
@@ -246,6 +246,22 @@ class TFC3x(keras.layers.Layer):
         return self.cv3(tf.concat((self.m(self.cv1(inputs)), self.cv2(inputs)), axis=3))
 
 
+class TFMP(keras.layers.Layer):
+    def __init__(self, k=2, w=None):
+        super().__init__()
+        self.m = keras.layers.MaxPool2D(pool_size=k, strides=k, padding='SAME')
+
+    def call(self, inputs):
+        return self.m(inputs)
+
+class TFSP(keras.layers.Layer):
+    def __init__(self, k=3, s=1, w=None):
+        super().__init__()
+        self.m = keras.layers.MaxPool2D(pool_size=k, strides=s, padding='SAME')
+
+    def call(self, inputs):
+        return self.m(inputs)
+
 class TFSPP(keras.layers.Layer):
     # Spatial pyramid pooling layer used in YOLOv3-SPP
     def __init__(self, c1, c2, k=(5, 9, 13), act=True, w=None):
@@ -285,8 +301,6 @@ class TFDetect(keras.layers.Layer):
     # TF YOLOv5 Detect layer
     def __init__(self, nc=80, anchors=(), ch=(), imgsz=(640, 640), w=None):  # detection layer
         super().__init__()
-        if onnx_setting.export_onnx == True:
-            imgsz = [val * 2 for val in imgsz]
         self.stride = tf.convert_to_tensor(w.stride.numpy(), dtype=tf.float32)
         self.nc = nc  # number of classes
         self.no = nc + 5  # number of outputs per anchor
@@ -349,6 +363,8 @@ class TFDetect(keras.layers.Layer):
         xv, yv = tf.meshgrid(tf.range(nx), tf.range(ny))
         return tf.cast(tf.reshape(tf.stack([xv, yv], 2), [1, 1, ny * nx, 2]), dtype=tf.float32)
 
+class TFIDetect(TFDetect):
+    pass
 
 class TFUpsample(keras.layers.Layer):
     # TF version of torch.nn.Upsample()
@@ -377,7 +393,7 @@ class TFConcat(keras.layers.Layer):
 
 
 def parse_model(d, ch, model, imgsz):  # model_dict, input_channels(3)
-    LOGGER.info(f"\n{'':>3}{'from':>18}{'n':>3}{'params':>10}  {'module':<40}{'arguments':<30}")
+    print(f"\n{'':>3}{'from':>18}{'n':>3}{'params':>10}  {'module':<40}{'arguments':<30}")
     anchors, nc, gd, gw = d['anchors'], d['nc'], d['depth_multiple'], d['width_multiple']
     na = (len(anchors[0]) // 2) if isinstance(anchors, list) else anchors  # number of anchors
     no = na * (nc + 5)  # number of outputs = anchors * (classes + 5)
@@ -407,11 +423,13 @@ def parse_model(d, ch, model, imgsz):  # model_dict, input_channels(3)
             args = [ch[f]]
         elif m is Concat:
             c2 = sum(ch[-1 if x == -1 else x + 1] for x in f)
-        elif m is Detect:
+        elif (m is Detect) or (m is IDetect):
             args.append([ch[x + 1] for x in f])
             if isinstance(args[1], int):  # number of anchors
                 args[1] = [list(range(args[1] * 2))] * len(f)
-            args.append(imgsz)
+            if has_Focus_layer(model):
+                imgsz_reform = [val * 2 for val in imgsz]
+            args.append(imgsz_reform)
         else:
             c2 = ch[f]
 
@@ -423,7 +441,7 @@ def parse_model(d, ch, model, imgsz):  # model_dict, input_channels(3)
         t = str(m)[8:-2].replace('__main__.', '')  # module type
         np = sum(x.numel() for x in torch_m_.parameters())  # number params
         m_.i, m_.f, m_.type, m_.np = i, f, t, np  # attach index, 'from' index, type, number params
-        LOGGER.info(f'{i:>3}{str(f):>18}{str(n):>3}{np:>10}  {t:<40}{str(args):<30}')  # print
+        print(f'{i:>3}{str(f):>18}{str(n):>3}{np:>10}  {t:<40}{str(args):<30}')  # print
         save.extend(x % i for x in ([f] if isinstance(f, int) else f) if x != -1)  # append to savelist
         layers.append(m_)
         ch.append(c2)
@@ -444,7 +462,7 @@ class TFModel:
 
         # Define model
         if nc and nc != self.yaml['nc']:
-            LOGGER.info(f"Overriding {cfg} nc={self.yaml['nc']} with nc={nc}")
+            print(f"Overriding {cfg} nc={self.yaml['nc']} with nc={nc}")
             self.yaml['nc'] = nc  # override yaml value
         self.model, self.savelist = parse_model(deepcopy(self.yaml), ch=[ch], model=model, imgsz=imgsz)
 
@@ -582,7 +600,7 @@ def run(
     keras_model = keras.Model(inputs=im, outputs=tf_model.predict(im))
     keras_model.summary()
 
-    LOGGER.info('PyTorch, TensorFlow and Keras models successfully verified.\nUse export.py for TF model export.')
+    print('PyTorch, TensorFlow and Keras models successfully verified.\nUse export.py for TF model export.')
 
 
 def parse_opt():
@@ -593,7 +611,7 @@ def parse_opt():
     parser.add_argument('--dynamic', action='store_true', help='dynamic batch size')
     opt = parser.parse_args()
     opt.imgsz *= 2 if len(opt.imgsz) == 1 else 1  # expand
-    print_args(vars(opt))
+    # print_args(vars(opt))
     return opt
 
 

@@ -16,6 +16,18 @@ from utils.general import set_logging, check_img_size, colorstr, check_version, 
 from utils.torch_utils import select_device
 from utils.add_nms import RegisterNMS
 
+import onnx_setting
+
+from models.common import has_Focus_layer
+
+def reformat_img_wFocus(img, has_Focus:bool):
+    if onnx_setting.export_onnx == True:
+        import copy
+        shape = img.shape
+        img_out = copy.deepcopy(img)
+        if has_Focus:
+            img_out = img_out.view( shape[0], shape[1] * 4, shape[2]//2, shape[3]//2 )
+    return img_out
 
 def export_saved_model(model,
                        im,
@@ -30,51 +42,50 @@ def export_saved_model(model,
                        keras=False,
                        prefix=colorstr('TensorFlow SavedModel:')):
     # YOLOv5 TensorFlow SavedModel export
-    try:
-        import tensorflow as tf
-        from tensorflow.python.framework.convert_to_constants import convert_variables_to_constants_v2
+    # try:
+    import tensorflow as tf
+    from tensorflow.python.framework.convert_to_constants import convert_variables_to_constants_v2
 
-        import onnx_setting
-        onnx_setting.export_onnx = True
-        #
-        shape = im.shape
-        im = im.view( shape[0], shape[1] * 4, shape[2]//2, shape[3]//2 )
+    # 
+    onnx_setting.export_onnx = True
+    im_reform = reformat_img_wFocus(im, has_Focus_layer(model))
+    #
+    from models.tf import TFDetect, TFModel
 
-        from models.tf import TFDetect, TFModel
+    print(f'\n{prefix} starting export with tensorflow {tf.__version__}...')
+    f = str(file).replace('.pt', '_saved_model')
+    batch_size, ch, *imgsz = list(im_reform.shape)  # BCHW
 
-        print(f'\n{prefix} starting export with tensorflow {tf.__version__}...')
-        f = str(file).replace('.pt', '_saved_model')
-        batch_size, ch, *imgsz = list(im.shape)  # BCHW
+    tf_model = TFModel(cfg=model.yaml, ch=ch, model=model, nc=model.nc, imgsz=imgsz)
+    im_reform = tf.zeros((batch_size, *imgsz, ch))  # BHWC order for TensorFlow
+    _ = tf_model.predict(im_reform, tf_nms, agnostic_nms, topk_per_class, topk_all, iou_thres, conf_thres)
+    inputs = tf.keras.Input(shape=(*imgsz, ch), batch_size=None if dynamic else batch_size)
+    outputs = tf_model.predict(inputs, tf_nms, agnostic_nms, topk_per_class, topk_all, iou_thres, conf_thres)
+    keras_model = tf.keras.Model(inputs=inputs, outputs=outputs)
+    keras_model.trainable = False
+    keras_model.summary()
+    if keras:
+        keras_model.save(f, save_format='tf')
+    else:
+        spec = tf.TensorSpec(keras_model.inputs[0].shape, keras_model.inputs[0].dtype)
+        m = tf.function(lambda x: keras_model(x))  # full model
+        m = m.get_concrete_function(spec)
+        frozen_func = convert_variables_to_constants_v2(m)
+        tfm = tf.Module()
+        tfm.__call__ = tf.function(lambda x: frozen_func(x)[:4] if tf_nms else frozen_func(x)[0], [spec])
+        tfm.__call__(im_reform)
+        tf.saved_model.save(tfm,
+                            f,
+                            options=tf.saved_model.SaveOptions(experimental_custom_gradients=False)
+                            if check_version(tf.__version__, '2.6') else tf.saved_model.SaveOptions())
+    print(f'{prefix} export success, saved as {f} ({file_size(f):.1f} MB)')
+    return keras_model, f
+    # except Exception as e:
+    #     print(f'\n{prefix} export failure: {e}')
+    #     return None, None
 
-        tf_model = TFModel(cfg=model.yaml, ch=ch, model=model, nc=model.nc, imgsz=imgsz)
-        im = tf.zeros((batch_size, *imgsz, ch))  # BHWC order for TensorFlow
-        _ = tf_model.predict(im, tf_nms, agnostic_nms, topk_per_class, topk_all, iou_thres, conf_thres)
-        inputs = tf.keras.Input(shape=(*imgsz, ch), batch_size=None if dynamic else batch_size)
-        outputs = tf_model.predict(inputs, tf_nms, agnostic_nms, topk_per_class, topk_all, iou_thres, conf_thres)
-        keras_model = tf.keras.Model(inputs=inputs, outputs=outputs)
-        keras_model.trainable = False
-        keras_model.summary()
-        if keras:
-            keras_model.save(f, save_format='tf')
-        else:
-            spec = tf.TensorSpec(keras_model.inputs[0].shape, keras_model.inputs[0].dtype)
-            m = tf.function(lambda x: keras_model(x))  # full model
-            m = m.get_concrete_function(spec)
-            frozen_func = convert_variables_to_constants_v2(m)
-            tfm = tf.Module()
-            tfm.__call__ = tf.function(lambda x: frozen_func(x)[:4] if tf_nms else frozen_func(x)[0], [spec])
-            tfm.__call__(im)
-            tf.saved_model.save(tfm,
-                                f,
-                                options=tf.saved_model.SaveOptions(experimental_custom_gradients=False)
-                                if check_version(tf.__version__, '2.6') else tf.saved_model.SaveOptions())
-        print(f'{prefix} export success, saved as {f} ({file_size(f):.1f} MB)')
-        return keras_model, f
-    except Exception as e:
-        print(f'\n{prefix} export failure: {e}')
-        return None, None
 
-def export_tflite(keras_model, im, file, int8, data, nms, agnostic_nms, prefix=colorstr('TensorFlow Lite:')):
+def export_tflite(keras_model, im, file, int8, data, nms=None, agnostic_nms=None, prefix=colorstr('TensorFlow Lite:')):
     # YOLOv5 TensorFlow Lite export
     try:
         from utils.datasets import LoadImages
@@ -167,6 +178,8 @@ if __name__ == '__main__':
         # elif isinstance(m, models.yolo.Detect):
         #     m.forward = m.forward_export  # assign forward (optional)
     model.model[-1].export = not opt.grid  # set Detect() layer grid export
+    
+    onnx_setting.export_onnx = False
     y = model(img)  # dry run
     if opt.include_nms:
         model.model[-1].include_nms = True
@@ -260,7 +273,10 @@ if __name__ == '__main__':
                 else:
                     model.model[-1].concat = True
 
-            torch.onnx.export(model, img, f, verbose=False, opset_version=12, input_names=['images'],
+            onnx_setting.export_onnx = True
+            im_reform = reformat_img_wFocus(img, has_Focus_layer(model))
+
+            torch.onnx.export(model, im_reform, f, verbose=False, opset_version=12, input_names=['images'],
                             output_names=output_names,
                             dynamic_axes=dynamic_axes)
 
@@ -315,8 +331,7 @@ if __name__ == '__main__':
                                          file=opt.weights,
                                          dynamic=False,
                                         )
-        if opt.tflite or opt.edgetpu:
-            _ = export_tflite(model, img, file=opt.weights, int8=opt.int8 or opt.edgetpu, data=opt.data)
+        _ = export_tflite(model, img, file=opt.weights, int8=opt.int8, data=opt.data if opt.int8 else None)
 
     # Finish
     print('\nExport complete (%.2fs). Visualize with https://github.com/lutzroeder/netron.' % (time.time() - t))
