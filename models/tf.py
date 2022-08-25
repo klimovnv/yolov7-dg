@@ -27,8 +27,8 @@ import torch
 import torch.nn as nn
 from tensorflow import keras
 
-from models.common import (C3, SPP, SPPF, Bottleneck, BottleneckCSP, C3x, Concat, Conv, CrossConv, DWConv, has_Focus_layer,
-                           DWConvTranspose2d, Focus, autopad, MP, SP)
+from models.common import (C3, SPP, SPPF, Bottleneck, BottleneckCSP, C3x, Concat, Conv, CrossConv,
+                           DWConvTranspose2d, Focus, MP, SP, autopad, DWConv, has_Focus_layer)
 from models.experimental import MixConv2d, attempt_load
 from models.yolo import Detect, IDetect
 from utils.activations import SiLU
@@ -501,7 +501,10 @@ class TFModel:
                                                             conf_thres,
                                                             clip_boxes=False)
             return nms, x[1]
-        return x[0]  # output only first tensor [1,6300,85] = [xywh, conf, class0, class1, ...]
+        if onnx_setting.export_onnx:
+            return x
+        else:
+            return x[0]  # output only first tensor [1,6300,85] = [xywh, conf, class0, class1, ...]
         # x = x[0][0]  # [x(1,6300,85), ...] to x(6300,85)
         # xywh = x[..., :4]  # x(6300,4) boxes
         # conf = x[..., 4:5]  # x(6300,1) confidences
@@ -569,7 +572,7 @@ def activations(act=nn.SiLU):
 
 def representative_dataset_gen(dataset, ncalib=100):
     # Representative dataset generator for use with converter.representative_dataset, returns a generator of np arrays
-    for n, (path, img, im0s, vid_cap, string) in enumerate(dataset):
+    for n, (path, img, im0s, vid_cap) in enumerate(dataset):
         im = np.transpose(img, [1, 2, 0])
         im = np.expand_dims(im, axis=0).astype(np.float32)
         im /= 255

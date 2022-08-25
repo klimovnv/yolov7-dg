@@ -85,40 +85,48 @@ def export_saved_model(model,
     #     return None, None
 
 
-def export_tflite(keras_model, im, file, int8, data, nms=None, agnostic_nms=None, prefix=colorstr('TensorFlow Lite:')):
+def export_tflite(keras_model, im, file, int8, data, nms=None, agnostic_nms=None, prefix=colorstr('TensorFlow Lite:'), has_Focus_layer=False, max_int8_img_cnt=100):
     # YOLOv5 TensorFlow Lite export
-    try:
-        from utils.datasets import LoadImages
-        import tensorflow as tf
+    # try:
+    from utils.datasets import LoadImages
+    import tensorflow as tf
+    from yolov5_quant_utils import datasetGenerateImagesYolov5
+    import yaml
 
-        print(f'\n{prefix} starting export with tensorflow {tf.__version__}...')
-        batch_size, ch, *imgsz = list(im.shape)  # BCHW
-        # f = str(file).replace('.pt', '-fp16.tflite')
-        f = str(file).replace('.pt', '-fp32.tflite')
+    print(f'\n{prefix} starting export with tensorflow {tf.__version__}...')
+    batch_size, ch, *imgsz = list(im.shape)  # BCHW
+    # f = str(file).replace('.pt', '-fp16.tflite')
+    f = str(file).replace('.pt', '-fp32.tflite')
 
-        converter = tf.lite.TFLiteConverter.from_keras_model(keras_model)
-        converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS]
-        converter.target_spec.supported_types = [tf.float32]
-        converter.optimizations = [tf.lite.Optimize.DEFAULT]
-        if int8:
-            from models.tf import representative_dataset_gen
-            dataset = LoadImages(check_dataset(data)['train'], img_size=imgsz, auto=False)
-            converter.representative_dataset = lambda: representative_dataset_gen(dataset, ncalib=100)
-            converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
-            converter.target_spec.supported_types = []
-            converter.inference_input_type = tf.uint8  # or tf.int8
-            converter.inference_output_type = tf.uint8  # or tf.int8
-            converter.experimental_new_quantizer = True
-            f = str(file).replace('.pt', '-int8.tflite')
-        if nms or agnostic_nms:
-            converter.target_spec.supported_ops.append(tf.lite.OpsSet.SELECT_TF_OPS)
+    converter = tf.lite.TFLiteConverter.from_keras_model(keras_model)
+    converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS]
+    converter.target_spec.supported_types = [tf.float32]
+    converter.optimizations = [tf.lite.Optimize.DEFAULT]
+    if int8:
+        from models.tf import representative_dataset_gen
+        with open(data) as f:
+            data_dict = yaml.load(f, Loader=yaml.SafeLoader)  # data dict
+        if has_Focus_layer:
+            converter.representative_dataset = lambda: datasetGenerateImagesYolov5(image_size=imgsz, image_mask=data_dict['val']+'/*.jpg', maximum_match=max_int8_img_cnt, print_filenames=True )
+        else:
+            dataset = LoadImages(data_dict['val'], img_size=imgsz)
+            converter.representative_dataset = lambda: representative_dataset_gen(dataset, ncalib=max_int8_img_cnt)
+        converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+        converter.target_spec.supported_types = []
+        converter.inference_input_type = tf.uint8  # or tf.int8
+        converter.inference_output_type = tf.uint8  # or tf.int8
+        converter.experimental_new_quantizer = True
+        converter._experimental_disable_per_channel=True    # disbable per channel quant
+        f = str(file).replace('.pt', '-int8.tflite')
+    if nms or agnostic_nms:
+        converter.target_spec.supported_ops.append(tf.lite.OpsSet.SELECT_TF_OPS)
 
-        tflite_model = converter.convert()
-        open(f, "wb").write(tflite_model)
-        print(f'{prefix} export success, saved as {f} ({file_size(f):.1f} MB)')
-        return f
-    except Exception as e:
-        print(f'\n{prefix} export failure: {e}')
+    tflite_model = converter.convert()
+    open(f, "wb").write(tflite_model)
+    print(f'{prefix} export success, saved as {f} ({file_size(f):.1f} MB)')
+    return f
+    # except Exception as e:
+    #     print(f'\n{prefix} export failure: {e}')
 
 
 
@@ -126,6 +134,7 @@ def export_tflite(keras_model, im, file, int8, data, nms=None, agnostic_nms=None
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
+    parser.add_argument('--data', type=str, default=ROOT / 'data/coco128.yaml', help='dataset.yaml path')
     parser.add_argument('--weights', type=str, default='./yolor-csp-c.pt', help='weights path')
     parser.add_argument('--img-size', nargs='+', type=int, default=[640, 640], help='image size')  # height, width
     parser.add_argument('--batch-size', type=int, default=1, help='batch size')
@@ -142,6 +151,7 @@ if __name__ == '__main__':
     parser.add_argument('--include-nms', action='store_true', help='export end2end onnx')
     parser.add_argument('--fp16', action='store_true', help='CoreML FP16 half-precision export')
     parser.add_argument('--int8', action='store_true', help='CoreML INT8 quantization')
+    parser.add_argument('--max-int8-img-cnt', type=int, default=100, help='max num images used for quantization')
     parser.add_argument('--tflite', action='store_true', help='export tflite')
     parser.add_argument('--onnx', action='store_true', help='export onnx')
     parser.add_argument('--torchscript', action='store_true', help='export torchscript')
@@ -326,12 +336,12 @@ if __name__ == '__main__':
     if opt.tflite:
         if opt.int8:  # TFLite --int8 bug https://github.com/ultralytics/yolov5/issues/5707
             check_requirements(('flatbuffers==1.12',))  # required before `import tensorflow`
-        model, _ = export_saved_model(model.cpu(),
+        keras_model, _ = export_saved_model(model.cpu(),
                                          img,
                                          file=opt.weights,
                                          dynamic=False,
                                         )
-        _ = export_tflite(model, img, file=opt.weights, int8=opt.int8, data=opt.data if opt.int8 else None)
+        _ = export_tflite(keras_model, img, file=opt.weights, int8=opt.int8, data=opt.data if opt.int8 else None, has_Focus_layer=has_Focus_layer(model), max_int8_img_cnt=opt.max_int8_img_cnt)
 
     # Finish
     print('\nExport complete (%.2fs). Visualize with https://github.com/lutzroeder/netron.' % (time.time() - t))
