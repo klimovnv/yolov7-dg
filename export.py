@@ -24,7 +24,7 @@ def parse_opt():
     )
     parser.add_argument(
         "--img-size", nargs="+", type=int, default=[640, 640], help="image size"
-    )  # Height, width
+    )  # height, width
     parser.add_argument("--batch-size", type=int, default=1, help="batch size")
     parser.add_argument("--dynamic", action="store_true", help="dynamic ONNX axes")
     parser.add_argument(
