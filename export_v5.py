@@ -44,6 +44,7 @@ def export_saved_model(
     model,
     im,
     file,
+    export_pth,
     dynamic,
     tf_nms=False,
     agnostic_nms=False,
@@ -68,7 +69,7 @@ def export_saved_model(
     from yolov7_dg.models.tf import TFDetect, TFModel
 
     print(f"\n{prefix} starting export with tensorflow {tf.__version__}...")
-    f = str(file).replace(".pt", "_saved_model")
+    f = export_pth + str(file).replace(".pt", "_saved_model").rsplit("/", 1)[1]
     batch_size, ch, *imgsz = list(im_reform.shape)  # BCHW
 
     tf_model = TFModel(cfg=model.yaml, ch=ch, model=model, nc=model.nc, imgsz=imgsz)
@@ -115,6 +116,7 @@ def export_tflite(
     keras_model,
     im,
     file,
+    export_pth,
     int8,
     data,
     nms=None,
@@ -133,7 +135,7 @@ def export_tflite(
     print(f"\n{prefix} starting export with tensorflow {tf.__version__}...")
     batch_size, ch, *imgsz = list(im.shape)  # BCHW
     # f = str(file).replace('.pt', '-fp16.tflite')
-    f = str(file).replace(".pt", "-fp32.tflite")
+    f = export_pth + str(file).replace(".pt", "-fp32.tflite").rsplit("/", 1)[1]
 
     converter = tf.lite.TFLiteConverter.from_keras_model(keras_model)
     converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS]
@@ -162,7 +164,7 @@ def export_tflite(
         converter.inference_output_type = tf.uint8  # or tf.int8
         converter.experimental_new_quantizer = True
         converter._experimental_disable_per_channel = True  # disbable per channel quant
-        f = str(file).replace(".pt", "-int8.tflite")
+        f = export_pth + str(file).replace(".pt", "-int8.tflite").rsplit("/", 1)[1]
     if nms or agnostic_nms:
         converter.target_spec.supported_ops.append(tf.lite.OpsSet.SELECT_TF_OPS)
 
@@ -244,6 +246,7 @@ def main(opt):
     print(opt)
     set_logging()
     t = time.time()
+    export_pth = opt.weights.rsplit("/", 3)[0] + "/porting/"
 
     # Load PyTorch model
     device = select_device(opt.device)
@@ -283,7 +286,10 @@ def main(opt):
     if opt.torchscript:
         try:
             print("\nStarting TorchScript export with torch %s..." % torch.__version__)
-            f = opt.weights.replace(".pt", ".torchscript.pt")  # filename
+            f = (
+                export_pth
+                + opt.weights.replace(".pt", ".torchscript.pt").rsplit("/", 1)[1]
+            )  # filename
             ts = torch.jit.trace(model, img, strict=False)
             ts.save(f)
             print("TorchScript export success, saved as %s" % f)
@@ -325,7 +331,9 @@ def main(opt):
                 else:
                     print("quantization only supported on macOS, skipping...")
 
-            f = opt.weights.replace(".pt", ".mlmodel")  # filename
+            f = (
+                export_pth + opt.weights.replace(".pt", ".mlmodel").rsplit("/", 1)[1]
+            )  # filename
             ct_model.save(f)
             print("CoreML export success, saved as %s" % f)
         except Exception as e:
@@ -337,7 +345,10 @@ def main(opt):
                 "\nStarting TorchScript-Lite export with torch %s..."
                 % torch.__version__
             )
-            f = opt.weights.replace(".pt", ".torchscript.ptl")  # filename
+            f = (
+                export_pth
+                + opt.weights.replace(".pt", ".torchscript.ptl").rsplit("/", 1)[1]
+            )  # filename
             tsl = torch.jit.trace(model, img, strict=False)
             tsl = optimize_for_mobile(tsl)
             tsl._save_for_lite_interpreter(f)
@@ -351,7 +362,9 @@ def main(opt):
             import onnx
 
             print("\nStarting ONNX export with onnx %s..." % onnx.__version__)
-            f = opt.weights.replace(".pt", ".onnx")  # filename
+            f = (
+                export_pth + opt.weights.replace(".pt", ".onnx").rsplit("/", 1)[1]
+            )  # filename
             model.eval()
             output_names = ["classes", "boxes"] if y is None else ["output"]
             dynamic_axes = None
@@ -488,12 +501,14 @@ def main(opt):
             model.cpu(),
             img,
             file=opt.weights,
+            export_pth=export_pth,
             dynamic=False,
         )
         saved_tf = export_tflite(
             keras_model,
             img,
             file=opt.weights,
+            export_pth=export_pth,
             int8=opt.int8,
             data=opt.data if opt.int8 else None,
             has_Focus_layer=has_Focus_layer(model),

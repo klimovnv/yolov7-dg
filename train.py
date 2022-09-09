@@ -757,7 +757,7 @@ def train(hyp, opt, device, tb_writer=None):
     else:
         dist.destroy_process_group()
     f = open(opt.outfile, "w")
-    f.write(str(save_dir))
+    f.write(str(best))
     f.close()
     torch.cuda.empty_cache()
     return results
@@ -933,7 +933,7 @@ def main(opt):
         opt.img_size.extend(
             [opt.img_size[-1]] * (2 - len(opt.img_size))
         )  # extend to 2 sizes (train, test)
-        opt.name = "evolve" if opt.evolve else opt.name
+        opt.name = "evolve" if opt.evolve else opt.name + "/train"
         opt.save_dir = increment_path(
             Path(opt.project) / opt.name, exist_ok=opt.exist_ok | opt.evolve
         )  # increment run
